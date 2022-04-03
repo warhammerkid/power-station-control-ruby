@@ -1,15 +1,4 @@
 class DataPage
-  class << self
-    def def_range(offset, name, type)
-      @ranges ||= []
-      @ranges << PageRange.new(offset, name, type)
-    end
-
-    def ranges
-      @ranges || []
-    end
-  end
-
   def initialize
     @data = ("\0" * 512).b
   end
