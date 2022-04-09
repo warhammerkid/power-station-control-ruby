@@ -1,3 +1,4 @@
+require 'concurrent-ruby'
 require 'mqtt'
 require 'digest/crc16' # digest-crc gem
 require_relative 'data_pages'
@@ -54,18 +55,21 @@ class MqttClient
     return if @device_type.nil? || @serial_number.nil?
 
     cmd = RangeQueryCommand.new(page, offset, size)
+
+    payload = cmd.to_s
+    payload << Checksum.digest(payload)
+    packet = MQTT::Packet::Publish.new(
+      topic: "SUB/#{@device_type}/#{@serial_number}",
+      payload: payload
+    )
+
+    future = Concurrent::Promises.resolvable_future
     @mutex.synchronize do
-      @query_commands << cmd
-
-      payload = cmd.to_s
-      payload << Checksum.digest(payload)
-      packet = MQTT::Packet::Publish.new(
-        topic: "SUB/#{@device_type}/#{@serial_number}",
-        payload: payload
-      )
-
+      @query_commands << [cmd, future]
       @socket.write_nonblock(packet)
     end
+
+    future.value!(1, nil) # Timeout after 1000ms waiting
   end
 
   private
@@ -143,10 +147,11 @@ class MqttClient
     case data[2]
     when "\x03".b
       # Client response to a range request
-      query = @mutex.synchronize { @query_commands.shift }
+      query, future = @mutex.synchronize { @query_commands.shift }
       page = @pages.fetch(query.page)
       len = data[3].ord
       page.update(query.offset, data[4, len])
+      future.fulfill(page)
     when "\x06".b
       # Single field update
       page = @pages.fetch(data[3].ord)
@@ -159,6 +164,10 @@ class MqttClient
       page = @pages.fetch(data[3].ord)
       len = data[7].ord
       page.update(data[4].ord, data[8, len].b)
+    when "\x83".b
+      # Query error
+      query, future = @mutex.synchronize { @query_commands.shift }
+      future.reject('Invalid query')
     else
       $logger.error "Unknown client message: #{data.inspect}"
     end

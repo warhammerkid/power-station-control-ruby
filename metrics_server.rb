@@ -8,6 +8,7 @@ class MetricsServer
     @mutex = Mutex.new
     @thread = nil
     @stopped = false
+    @last_times = {}
   end
 
   def start
@@ -43,26 +44,21 @@ class MetricsServer
     dc_output_power_wh = build_counter('dc_output_power_wh', 'Cumulative DC power output')
     total_battery_percent = build_gauge('total_battery_percent', 'Total battery percent')
 
-    last_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     loop do
       break if stopped?
+
+      start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
       # Refresh data
       @mqtt_server.clients.each do |client|
         break if stopped?
-        client.request_update(0x00, 0x24, 13)
-      end
-      sleep 2
 
-      # Update metrics
-      @mqtt_server.clients.each do |client|
+        page = client.request_update(0x00, 0x24, 13)
+        next if page.nil?
+
         labels = { device_type: client.device_type, serial_number: client.serial_number }
+        elapsed_hours = get_elapsed_hours(client.serial_number)
 
-        now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        elapsed_hours = (now - last_time) / 3600.0
-        last_time = now
-
-        page = client.status_page
         solar_power.observe(page.solar_power, labels)
         solar_power_wh.observe(page.solar_power * elapsed_hours, labels)
         grid_power.observe(page.grid_power, labels)
@@ -73,6 +69,9 @@ class MetricsServer
         dc_output_power_wh.observe(page.dc_output_power * elapsed_hours, labels)
         total_battery_percent.observe(page.battery_percent, labels)
       end
+
+      refresh_duration = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_time
+      sleep [2 - refresh_duration, 0].max
     end
   end
 
@@ -90,5 +89,17 @@ class MetricsServer
     metric = PrometheusExporter::Metric::Counter.new(name, hint)
     @server.collector.register_metric(metric)
     metric
+  end
+
+  def get_elapsed_hours(serial_number)
+    if @last_times.key?(serial_number)
+      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      elapsed_hours = (now - @last_times[serial_number]) / 3600.0
+      @last_times[serial_number] = now
+      elapsed_hours
+    else
+      @last_times[serial_number] = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      0
+    end
   end
 end
