@@ -3,6 +3,10 @@ class DataPage
     @data = ("\0" * 512).b
   end
 
+  def raw
+    @data.dup
+  end
+
   def update(offset, data)
     @data[offset * 2, data.size] = data
   end
@@ -62,6 +66,12 @@ class StatusPage < DataPage
     parse_bool(0x31)
   end
 
+  # There's only space to show one battery pack's info, so this tells you what
+  # pack is currently being shown
+  def current_pack
+    parse_uint(0x60)
+  end
+
   # TODO: Figure out data structure for what appears to be detailed battery
   # info in the higher ranges
 end
@@ -86,6 +96,12 @@ class ControlPage < DataPage
 
   def ups_mode
     UPS_MODES.fetch(parse_uint(0xB9))
+  end
+
+  # There's only space to show one battery pack's info, so this tells you what
+  # pack is currently selected
+  def current_pack
+    parse_uint(0xBE)
   end
 
   # AC output switch on/off

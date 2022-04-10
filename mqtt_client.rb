@@ -68,6 +68,20 @@ class MqttClient
     end
   end
 
+  def make_request(page, offset, data)
+    # Ignore if not ready
+    return if @device_type.nil? || @serial_number.nil?
+
+    payload = RangeUpdateCommand.new(page, offset, data).to_s
+    payload << Checksum.digest(payload)
+    packet = MQTT::Packet::Publish.new(
+      topic: "SUB/#{@device_type}/#{@serial_number}",
+      payload: payload
+    )
+
+    @mutex.synchronize { @socket.write_nonblock(packet) }
+  end
+
   private
 
   def handle
