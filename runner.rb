@@ -4,6 +4,7 @@ require_relative 'metrics_server'
 require_relative 'api_server'
 
 $logger = Logger.new($stdout)
+$stdout.sync = true
 
 # Start up servers
 mqtt_server = MqttServer.new.start
