@@ -1,179 +1,199 @@
 require 'logger'
-require 'socketry'
+require 'socket'
+require 'stringio'
 require 'mqtt'
 
-class ClientHandler
-  def initialize(socket, server, logger)
+class MqttClient
+  PACKET_SIZE = 1380
+  TIMEOUT = 60
+
+  def initialize(socket, server)
     @socket = socket
     @server = server
-    @logger = logger
     
     @mutex = Mutex.new
-    @subscribes = []
+    @stop_read, @stop_write = IO.pipe
     @connected = false
+    @thread = nil
+    @subscribes = []
   end
-  
+
   def start
-    Thread.new(&method(:handle))
+    @thread = Thread.new(&method(:handle))
+    @thread.abort_on_exception = true
+    self
   end
-  
+
+  def stop
+    @stop_write.write('stop')
+    @thread.join
+  end
+
   def subscribes
     @mutex.synchronize { @subscribes.dup }
   end
-  
+
   def connected?
     @mutex.synchronize { @connected }
   end
-  
+
   def publish(packet)
     @mutex.synchronize do
       @socket.write_nonblock(packet) if @connected
     end
   end
-  
+
   private
 
-  # Loop forever...
   def handle
-    @logger.info "Connected #{self.object_id}..."
+    $logger.info "New client connected #{self.object_id}..."
     loop do
-      # Listen for new data
-      data = @socket.readpartial(1024, timeout: 60)
-      break if data == :eof
-
-      io = StringIO.new(data)
-      if data[0] == "\x00".b
-        handle_bluetti_special(io)
-      else
-        packet = MQTT::Packet.read(io)
-        handle_mqtt(packet)
+      begin
+        data = @socket.read_nonblock(PACKET_SIZE)
+        if data[0] == "\x00".b
+          handle_mqtt_special(data)
+        else
+          stream = StringIO.new(data)
+          while !stream.eof?
+            packet = MQTT::Packet.read(stream)
+            handle_mqtt(packet)
+          end
+        end
+      rescue IO::WaitReadable
+        res, _, __ = IO.select([@socket, @stop_read], nil, nil, TIMEOUT)
+        break if res.nil? || res.include?(@stop_read)
+        retry
+      rescue IOError
+        # Disconnected
+        $logger.error "IOError for client #{self.object_id}"
+        break
+      rescue MQTT::ProtocolException => e
+        $logger.error e.full_message(highlight: false, order: :top)
       end
     end
-  rescue => e
-    @logger.error e.inspect
   ensure
-    @logger.warn 'Closing connection...'
     @mutex.synchronize do
       @connected = false
       @socket.close
     end
+    $logger.info "Client disconnected #{self.object_id}..."
   end
-  
-  def handle_bluetti_special(io)
-    io.getbyte # The first byte is 0x00
-    case io.getbyte
-    when 1
+
+  # MQTT packet type 0 is reserved, and Bluetti uses it for two special
+  # packets before sending an official MQTT connection packet. This parses
+  # those packets and responds appropriately.
+  def handle_mqtt_special(data)
+    case data[1]
+    when "\x01".b
       # Parse packet
-      str_len = read_uint(io)
-      @iot_id = io.read(str_len)
-      @logger.info "Client #{@iot_id} connected"
-      
+      str_len = data[2, 2].unpack('n').first
+      @iot_id = data[4, str_len]
+      $logger.info "Client #{@iot_id} connected"
+
       # Handle response
       stamp = [Time.now.to_i - 8 * 60 * 60].pack('N')
-      @socket.write_nonblock("\x00\x01\x00\x04#{stamp}")
-    when 2
+      write_nonblock("\x00\x01\x00\x04#{stamp}")
+    when "\x02".b
       # Parse packet
-      str_len = read_uint(io)
-      @client_sn = io.read(str_len)
-      @logger.info "Client sn: #{@client_sn}"
-      
+      str_len = data[2, 2].unpack('n').first
+      @device_type, @serial_number = data[4, str_len].split('&')
+      $logger.info "Client device #{@device_type}, serial number #{@serial_number}..."
+
       # Handle response
-      @socket.write_nonblock("\x00\x02\x00\x01\x01")
+      write_nonblock("\x00\x02\x00\x01\x01")
     else
       raise 'Unknown message'
     end
   end
-  
+
   def handle_mqtt(packet)
     case packet
     when MQTT::Packet::Connect
-      @logger.info "MQTT Connect: #{packet.inspect} password: #{packet.password.inspect}"
-      @mutex.synchronize do
-        @connected = true
-        @socket.write_nonblock(MQTT::Packet::Connack.new)
-      end
+      $logger.info "MQTT Connect: #{packet.inspect} password: #{packet.password.inspect}"
+      write_nonblock(MQTT::Packet::Connack.new)
+      @mutex.synchronize { @connected = true }
     when MQTT::Packet::Subscribe
-      @logger.info "MQTT Subscribe: #{packet.inspect}"
+      $logger.info "MQTT Subscribe: #{packet.inspect}"
       topic_names = packet.topics.map { _1[0] }
       @mutex.synchronize { @subscribes.concat(topic_names) }
 
       return_codes = topic_names.map { 0 }
-      response = MQTT::Packet::Suback.new(return_codes: return_codes)
-      @mutex.synchronize { @socket.write_nonblock(response) }
+      write_nonblock(MQTT::Packet::Suback.new(return_codes: return_codes))
     when MQTT::Packet::Publish
       @server.handle_publish(packet)
     when MQTT::Packet::Pingreq
-      @mutex.synchronize { @socket.write_nonblock(MQTT::Packet::Pingresp.new) }
+      write_nonblock(MQTT::Packet::Pingresp.new)
     when MQTT::Packet::Disconnect
+      $logger.info 'Disconnect request'
       @mutex.synchronize do
         @connected = false
         @socket.close
       end
     else
-      @logger.warn "Received unexpected packet: #{packet.inspect}"
+      $logger.warn "Received unexpected packet: #{packet.inspect}"
     end
   end
 
-  # Reads a 2 byte unsigned int from the given stream and returns it
-  def read_uint(io)
-    io.read(2).unpack('n').first
+  def write_nonblock(data)
+    @mutex.synchronize do
+      @socket.write_nonblock(data)
+    end
   end
 end
 
-class BluettiMqttServer
-  def initialize(port, logger)
-    @port = port
-    @logger = logger
+class MqttDebugServer
+  PORT = 18760
 
+  def initialize
     @mutex = Mutex.new
-    @stopped = false
+    @stop_read, @stop_write = IO.pipe
     @thread = nil
-    @server = nil
     @clients = []
     @publishes = Queue.new
   end
-  
+
   def start
-    handle_signals
     handle_publish_queue
     @thread = Thread.new(&method(:run))
     @thread.abort_on_exception = true
-    sleep
+    self
   end
-  
+
   def stop
-    @logger.info 'Stopping server...'
-    @mutex.synchronize { @stopped = true }
+    $logger.info 'Stopping MQTT server...'
+    @stop_write.write('stop')
     @thread.join
+    @clients.each(&:stop)
+    $logger.info 'MQTT server stopped'
   end
-  
+
   def handle_publish(packet)
     @publishes << packet
   end
-  
-  private
-  
-  def run
-    @logger.info "Starting server on port #{@port}..."
-    @server = Socketry::TCP::Server.new(@port)
-    loop do
-      break if stopped?
 
+  private
+
+  def run
+    $logger.info "Starting MQTT server on port #{PORT}..."
+    server = TCPServer.new(PORT)
+    loop do
       begin
-        socket = @server.accept(timeout: 1)
-        
-        @logger.info 'New connection received...'
-        client_handler = ClientHandler.new(socket, self, @logger)
-        @clients << client_handler
-        client_handler.start
-      rescue Socketry::TimeoutError
-        # Ignored
+        socket = server.accept_nonblock
+        client = MqttClient.new(socket, self)
+        @mutex.synchronize { @clients << client }
+        client.start
+      rescue IO::WaitReadable
+        readable, _, __ = IO.select([server, @stop_read])
+        if readable.include?(@stop_read)
+          break
+        else
+          retry
+        end
       end
     end
-  ensure
-    @server.close
+    server.close
   end
-  
+
   def handle_publish_queue
     @publish_thread = Thread.new do
       while (packet = @publishes.deq)
@@ -189,27 +209,25 @@ class BluettiMqttServer
     end
     @publish_thread.abort_on_exception = true
   end
-  
-  def stopped?
-    @mutex.synchronize { @stopped }
-  end
-  
-  def handle_signals
-    r, w = IO.pipe
-    main_thread = Thread.current
-    @signal_handler = Thread.new do
-      while (io = IO.select([r]))
-        stop
-        break
-      end
-      main_thread.run # Wake up from sleep
-    end
-    %w[INT TERM].each { |s| Signal.trap(s) { w.puts(s) } }
-  end
 end
 
-BluettiMqttServer.new(
-  18760,
-  Logger.new($stdout)
-).start
+$logger = Logger.new($stdout)
+$stdout.sync = true
 
+# Start debug server
+mqtt_server = MqttDebugServer.new.start
+
+# Start up signal handlers
+r, w = IO.pipe
+main_thread = Thread.current
+signal_handler = Thread.new do
+  while (io = IO.select([r]))
+    mqtt_server.stop
+    break
+  end
+  main_thread.run # Wake up from sleep
+end
+%w[INT TERM].each { |s| Signal.trap(s) { w.puts(s) } }
+
+# Sleep forever
+sleep
