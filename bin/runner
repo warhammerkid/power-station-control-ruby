@@ -1,15 +1,15 @@
+#!/bin/ruby
+
 require 'logger'
-require_relative 'mqtt_server'
-require_relative 'metrics_server'
-require_relative 'api_server'
+require_relative '../lib/power_station'
 
 $logger = Logger.new($stdout)
 $stdout.sync = true
 
 # Start up servers
-mqtt_server = MqttServer.new.start
-metrics_server = MetricsServer.new(mqtt_server).start
-api_server = ApiServer.new(mqtt_server, 3000).start
+mqtt_server = PowerStation::MQTT::Server.new.start
+metrics_server = PowerStation::MetricsServer.new(mqtt_server).start
+api_server = PowerStation::ApiServer.new(mqtt_server, 3000).start
 
 # Start up signal handlers
 r, w = IO.pipe
