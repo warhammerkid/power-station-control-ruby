@@ -9,7 +9,7 @@ $stdout.sync = true
 # Start up servers
 event_bus = PowerStation::EventBus.new.start
 mqtt_server = PowerStation::MQTT::Server.new.start
-metrics_server = PowerStation::MetricsServer.new(mqtt_server).start
+metrics_server = PowerStation::MetricsServer.new(event_bus).start
 api_server = PowerStation::ApiServer.new(event_bus, 3000).start
 
 # Start up signal handlers

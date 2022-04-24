@@ -3,82 +3,84 @@ require 'prometheus_exporter/server'
 
 module PowerStation
   class MetricsServer
-    def initialize(mqtt_server)
-      @mqtt_server = mqtt_server
+    def initialize(event_bus)
+      @event_bus = event_bus
       
       @mutex = Mutex.new
+      @elapsed_hours = {}
       @thread = nil
-      @stopped = false
     end
 
     def start
       @server = PrometheusExporter::Server::WebServer.new({})
       @server.start
 
-      @thread = Thread.new(&method(:run))
-      @thread.abort_on_exception = true
+      register_metrics
+      @event_bus.add_subscriber(self)
 
       self
     end
 
     def stop
       $logger.info 'Stopping metrics server...'
-      @mutex.synchronize { @stopped = true }
-      @thread.run # Wake up...
-      @thread.join
+      @server.stop
       $logger.info 'Metrics server stopped'
+    end
+
+    def handle_event(event)
+      device_state = event.device_state
+      labels = { device_type: device_state.device_type, serial_number: event.client_id }
+      if device_state.has?('solar_power')
+        value = device_state.fetch('solar_power')
+        @solar_power.observe(value, labels)
+        @solar_power_wh.observe(value * elapsed_hours('solar_power'), labels)
+      end
+      if device_state.has?('grid_power')
+        value = device_state.fetch('grid_power')
+        @grid_power.observe(value, labels)
+        @grid_power_wh.observe(value * elapsed_hours('grid_power'), labels)
+      end
+      if device_state.has?('ac_output_power')
+        value = device_state.fetch('ac_output_power')
+        @ac_output_power.observe(value, labels)
+        @ac_output_power_wh.observe(value * elapsed_hours('ac_output_power'), labels)
+      end
+      if device_state.has?('dc_output_power')
+        value = device_state.fetch('dc_output_power')
+        @dc_output_power.observe(value, labels)
+        @dc_output_power_wh.observe(value * elapsed_hours('dc_output_power'), labels)
+      end
+      if device_state.has?('total_battery_percent')
+        @total_battery_percent.observe(device_state.fetch('total_battery_percent'), labels)
+      end
     end
 
     private
 
-    def run
-      $logger.info 'Starting metrics server...'
-
-      solar_power = build_gauge('solar_power_watts', 'Current solar input')
-      solar_power_wh = build_counter('solar_power_wh', 'Total solar power generation')
-      grid_power = build_gauge('grid_power_watts', 'Current grid input')
-      grid_power_wh = build_counter('grid_power_wh', 'Total grid input')
-      ac_output_power = build_gauge('ac_output_power_watts', 'Current AC power output')
-      ac_output_power_wh = build_counter('ac_output_power_wh', 'Cumulative AC power output')
-      dc_output_power = build_gauge('dc_output_power_watts', 'Current DC power output')
-      dc_output_power_wh = build_counter('dc_output_power_wh', 'Cumulative DC power output')
-      total_battery_percent = build_gauge('total_battery_percent', 'Total battery percent')
-
-      last_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      loop do
-        break if stopped?
-
-        # Refresh data
-        @mqtt_server.clients.each do |client|
-          break if stopped?
-          client.request_update(0x00, 0x24, 13)
-        end
-        sleep 2
-
-        # Update metrics
-        @mqtt_server.clients.each do |client|
-          labels = { device_type: client.device_type, serial_number: client.serial_number }
-
-          now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-          elapsed_hours = (now - last_time) / 3600.0
-          last_time = now
-
-          page = client.status_page
-          solar_power.observe(page.solar_power, labels)
-          solar_power_wh.observe(page.solar_power * elapsed_hours, labels)
-          grid_power.observe(page.grid_power, labels)
-          grid_power_wh.observe(page.grid_power * elapsed_hours, labels)
-          ac_output_power.observe(page.ac_output_power, labels)
-          ac_output_power_wh.observe(page.ac_output_power * elapsed_hours, labels)
-          dc_output_power.observe(page.dc_output_power, labels)
-          dc_output_power_wh.observe(page.dc_output_power * elapsed_hours, labels)
-          total_battery_percent.observe(page.battery_percent, labels)
-        end
-      end
+    def register_metrics
+      @solar_power = build_gauge('solar_power_watts', 'Current solar input')
+      @solar_power_wh = build_counter('solar_power_wh', 'Total solar power generation')
+      @grid_power = build_gauge('grid_power_watts', 'Current grid input')
+      @grid_power_wh = build_counter('grid_power_wh', 'Total grid input')
+      @ac_output_power = build_gauge('ac_output_power_watts', 'Current AC power output')
+      @ac_output_power_wh = build_counter('ac_output_power_wh', 'Cumulative AC power output')
+      @dc_output_power = build_gauge('dc_output_power_watts', 'Current DC power output')
+      @dc_output_power_wh = build_counter('dc_output_power_wh', 'Cumulative DC power output')
+      @total_battery_percent = build_gauge('total_battery_percent', 'Total battery percent')
     end
 
-    def stopped?
-      @mutex.synchronize { @stopped }
+    def elapsed_hours(field_name)
+      @mutex.synchronize do
+        now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        if @elapsed_hours.key?(field_name)
+          last_time = @elapsed_hours[field_name]
+          @elapsed_hours[field_name] = now
+          (now - last_time) / 3600.0
+        else
+          @elapsed_hours[field_name] = now
+          0
+        end
+      end
     end
 
     def build_gauge(name, hint = '')
