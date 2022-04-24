@@ -6,7 +6,9 @@ module PowerStation
     class Server
       PORT = 18760
 
-      def initialize
+      def initialize(event_bus)
+        @event_bus = event_bus
+
         @mutex = Mutex.new
         @stop_read, @stop_write = IO.pipe
         @thread = nil
@@ -27,10 +29,6 @@ module PowerStation
         $logger.info 'MQTT server stopped'
       end
 
-      def clients
-        @mutex.synchronize { @clients.dup }
-      end
-
       private
 
       def run
@@ -39,7 +37,7 @@ module PowerStation
         loop do
           begin
             socket = server.accept_nonblock
-            client = Client.new(socket)
+            client = Client.new(socket, @event_bus)
             @mutex.synchronize { @clients << client }
             client.start
           rescue IO::WaitReadable

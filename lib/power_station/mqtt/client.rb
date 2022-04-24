@@ -1,6 +1,6 @@
 require 'mqtt'
 require 'digest/crc16' # digest-crc gem
-require_relative 'data_pages'
+require_relative 'payload_parser'
 require_relative 'server_commands'
 
 module PowerStation
@@ -8,83 +8,44 @@ module PowerStation
     class Client
       PACKET_SIZE = 1380
       TIMEOUT = 60
-      STATUS_PAGE_ID = 0x00
-      CONTROL_PAGE_ID = 0x0B
-      WIFI_PAGE_ID = 0x13
 
       attr_reader :device_type, :iot_id, :serial_number
 
-      def initialize(socket)
+      def initialize(socket, event_bus)
         @socket = socket
+        @event_bus = event_bus
 
         @mutex = Mutex.new
+        @stopped = false
         @stop_read, @stop_write = IO.pipe
-        @thread = nil
-        @pages = {
-          STATUS_PAGE_ID => StatusPage.new,
-          CONTROL_PAGE_ID => ControlPage.new,
-          WIFI_PAGE_ID => WifiPage.new
-        }
+        @handler_thread = nil
         @query_commands = []
       end
 
       def start
-        @thread = Thread.new(&method(:handle))
-        @thread.abort_on_exception = true
+        @handler_thread = Thread.new(&method(:handle))
+        @handler_thread.abort_on_exception = true
+
+        @poller_thread = Thread.new(&method(:poll))
+        @poller_thread.abort_on_exception = true
+
         self
       end
 
       def stop
+        @mutex.synchronize { @stopped = true }
+        @poller_thread.run
+        @poller_thread.join
+
         @stop_write.write('stop')
-        @socket.close
-      end
-
-      def status_page
-        @pages[STATUS_PAGE_ID]
-      end
-
-      def control_page
-        @pages[CONTROL_PAGE_ID]
-      end
-      
-      def wifi_page
-        @pages[WIFI_PAGE_ID]
-      end
-
-      def request_update(page, offset, size)
-        # Ignore if not ready
-        return if @device_type.nil? || @serial_number.nil?
-
-        cmd = RangeQueryCommand.new(page, offset, size)
-        @mutex.synchronize do
-          @query_commands << cmd
-
-          payload = cmd.to_s
-          payload << Checksum.digest(payload)
-          packet = ::MQTT::Packet::Publish.new(
-            topic: "SUB/#{@device_type}/#{@serial_number}",
-            payload: payload
-          )
-
-          @socket.write_nonblock(packet)
-        end
-      end
-
-      def make_request(page, offset, data)
-        # Ignore if not ready
-        return if @device_type.nil? || @serial_number.nil?
-
-        payload = RangeUpdateCommand.new(page, offset, data).to_s
-        payload << Checksum.digest(payload)
-        packet = ::MQTT::Packet::Publish.new(
-          topic: "SUB/#{@device_type}/#{@serial_number}",
-          payload: payload
-        )
-
-        @mutex.synchronize { @socket.write_nonblock(packet) }
+        @handler_thread.join
       end
 
       private
+
+      def stopped?
+        @mutex.synchronize { @stopped }
+      end
 
       def handle
         $logger.info "New client connected #{self.object_id}..."
@@ -94,13 +55,19 @@ module PowerStation
             if data[0] == "\x00".b
               handle_mqtt_special(data)
             else
-              packet = ::MQTT::Packet.parse(data)
-              handle_mqtt(packet)
+              stream = StringIO.new(data)
+              while !stream.eof?
+                packet = ::MQTT::Packet.read(stream)
+                handle_mqtt(packet)
+              end
             end
           rescue IO::WaitReadable
             res, _, __ = IO.select([@socket, @stop_read], nil, nil, TIMEOUT)
             break if res.nil? || res.include?(@stop_read)
             retry
+          rescue IOError
+            # Disconnected
+            break
           rescue ::MQTT::ProtocolException => e
             $logger.error e.full_message(highlight: false, order: :top)
           end
@@ -156,27 +123,59 @@ module PowerStation
       end
 
       def handle_publish(data)
-        case data[2]
-        when "\x03".b
-          # Client response to a range request
-          query = @mutex.synchronize { @query_commands.shift }
-          page = @pages.fetch(query.page)
-          len = data[3].ord
-          page.update(query.offset, data[4, len])
-        when "\x06".b
-          # Single field update
-          page = @pages.fetch(data[3].ord)
-          page.update(data[4].ord, data[5, 2].b)
-        when "\x10".b
-          # Ignore empty range updates...
-          return if data.size == 9
+        parser =
+          case data[2]
+          when "\x03".b
+            # Client response to a range request
+            query = @mutex.synchronize { @query_commands.shift }
+            len = data[3].ord
+            PayloadParser.new(query.page, query.offset, data[4, len])
+          when "\x06".b
+            # Single field update
+            PayloadParser.new(data[3].ord, data[4].ord, data[5, 2].b)
+          when "\x10".b
+            # Ignore empty range updates...
+            return if data.size == 9
 
-          # Range update
-          page = @pages.fetch(data[3].ord)
-          len = data[7].ord
-          page.update(data[4].ord, data[8, len].b)
-        else
-          $logger.error "Unknown client message: #{data.inspect}"
+            # Range update
+            len = data[7].ord
+            PayloadParser.new(data[3].ord, data[4].ord, data[8, len].b)
+          else
+            $logger.error "Unknown client message: #{data.inspect}"
+            return
+          end
+
+        # Publish parsed DeviceState
+        parser.parse!
+        device_state = DeviceState.new(@device_type, parser.parsed)
+        @event_bus.broadcast_device_state(@serial_number, device_state)
+      end
+
+      def poll
+        loop do
+          break if stopped?
+
+          if @device_type && @serial_number
+            send_query(0x00, 0x24, 13)
+          end
+
+          sleep 2
+        end
+      end
+
+      def send_query(page, offset, size)
+        cmd = RangeQueryCommand.new(page, offset, size)
+        @mutex.synchronize do
+          @query_commands << cmd
+
+          payload = cmd.to_s
+          payload << Checksum.digest(payload)
+          packet = ::MQTT::Packet::Publish.new(
+            topic: "SUB/#{@device_type}/#{@serial_number}",
+            payload: payload
+          )
+
+          @socket.write_nonblock(packet)
         end
       end
 
