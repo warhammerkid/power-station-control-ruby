@@ -19,7 +19,6 @@ module PowerStation
         @stopped = false
         @stop_read, @stop_write = IO.pipe
         @handler_thread = nil
-        @query_commands = []
       end
 
       def start
@@ -126,10 +125,18 @@ module PowerStation
         parser =
           case data[2]
           when "\x03".b
-            # Client response to a range request
-            query = @mutex.synchronize { @query_commands.shift }
+            # Client response to a range request. Assume page and offset from
+            # standard lengths.
             len = data[3].ord
-            PayloadParser.new(query.page, query.offset, data[4, len])
+            payload = data[4, len].b
+            case len
+            when 140
+              PayloadParser.new(0x00, 0x00, payload)
+            when 254
+              PayloadParser.new(0x00, 0x46, payload)
+            else
+              $logger.error "Unknown range response length #{len}: #{payload.inspect}"
+            end
           when "\x06".b
             # Single field update
             PayloadParser.new(data[3].ord, data[4].ord, data[5, 2].b)
@@ -156,27 +163,26 @@ module PowerStation
           break if stopped?
 
           if @device_type && @serial_number
-            send_query(0x00, 0x24, 13)
+            send_query(0x00, 0x00, 70)
+            sleep 1
+            send_query(0x00, 0x46, 127)
+            sleep 1
+          else
+            sleep 1
           end
-
-          sleep 2
         end
       end
 
       def send_query(page, offset, size)
-        cmd = RangeQueryCommand.new(page, offset, size)
-        @mutex.synchronize do
-          @query_commands << cmd
+        payload = RangeQueryCommand.new(page, offset, size).to_s
+        payload << Checksum.digest(payload)
 
-          payload = cmd.to_s
-          payload << Checksum.digest(payload)
-          packet = ::MQTT::Packet::Publish.new(
-            topic: "SUB/#{@device_type}/#{@serial_number}",
-            payload: payload
-          )
+        packet = ::MQTT::Packet::Publish.new(
+          topic: "SUB/#{@device_type}/#{@serial_number}",
+          payload: payload
+        )
 
-          @socket.write_nonblock(packet)
-        end
+        write_nonblock(packet)
       end
 
       def write_nonblock(data)

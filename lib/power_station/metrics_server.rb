@@ -53,6 +53,19 @@ module PowerStation
       if device_state.has?('total_battery_percent')
         @total_battery_percent.observe(device_state.fetch('total_battery_percent'), labels)
       end
+      if device_state.has?('pack_battery_percent')
+        @pack_battery_percent.observe(device_state.fetch('pack_battery_percent'), labels.merge(pack_num: 1))
+      end
+      if device_state.has?('packs')
+        device_state.fetch('packs').each do |pack|
+          pack.fetch('voltages', []).each_with_index do |voltage, i|
+            @cell_voltage.observe(
+              voltage,
+              labels.merge(pack_num: pack['pack_num'], cell_num: i + 1)
+            )
+          end
+        end
+      end
     end
 
     private
@@ -67,6 +80,8 @@ module PowerStation
       @dc_output_power = build_gauge('dc_output_power_watts', 'Current DC power output')
       @dc_output_power_wh = build_counter('dc_output_power_wh', 'Cumulative DC power output')
       @total_battery_percent = build_gauge('total_battery_percent', 'Total battery percent')
+      @pack_battery_percent = build_gauge('pack_battery_percent', 'Pack battery percent')
+      @cell_voltage = build_gauge('cell_voltage', 'Voltage of a single cell in a pack')
     end
 
     def elapsed_hours(field_name)
