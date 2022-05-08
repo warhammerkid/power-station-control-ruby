@@ -1,7 +1,8 @@
+# frozen_string_literal: true
+
 require 'mqtt'
-require 'digest/crc16' # digest-crc gem
+require 'digest/crc16_modbus' # digest-crc gem
 require_relative 'payload_parser'
-require_relative 'server_commands'
 
 module PowerStation
   module MQTT
@@ -122,6 +123,16 @@ module PowerStation
       end
 
       def handle_publish(data)
+        # Verify checksum - skip first byte and last 2
+        crc = Digest::CRC16Modbus.checksum(data[1, data.size - 3])
+        checksum = (crc & 0xFF).chr
+        checksum << ((crc & 0xFF00) >> 8).chr
+        if data[-2, 2] != checksum
+          $logger.error "Invalid checksum. Expected #{checksum.inspect}, got #{data[-2, 2].inspect}"
+          return
+        end
+
+        # Decode payload offset / size to build parser
         parser =
           case data[2]
           when "\x03".b
@@ -174,8 +185,8 @@ module PowerStation
       end
 
       def send_query(page, offset, size)
-        payload = RangeQueryCommand.new(page, offset, size).to_s
-        payload << Checksum.digest(payload)
+        # MQTT adds an extra \x01 to the beginning of the payload...
+        payload = "\x01".b + RangeQueryCommand.new(page, offset, size).to_s
 
         packet = ::MQTT::Packet::Publish.new(
           topic: "SUB/#{@device_type}/#{@serial_number}",
@@ -188,19 +199,6 @@ module PowerStation
       def write_nonblock(data)
         @mutex.synchronize do
           @socket.write_nonblock(data)
-        end
-      end
-
-      class Checksum < Digest::CRC16
-        INIT_CRC = 0xFE55
-
-        def self.pack(crc)
-          buffer = ''
-      
-          buffer << (crc & 0xff).chr
-          buffer << ((crc & 0xff00) >> 8).chr
-      
-          buffer
         end
       end
     end
