@@ -7,7 +7,7 @@ module PowerStation
       @event_bus = event_bus
       
       @mutex = Mutex.new
-      @elapsed_hours = {}
+      @integral_hours = {}
       @thread = nil
     end
 
@@ -30,25 +30,25 @@ module PowerStation
     def handle_event(event)
       device_state = event.device_state
       labels = { device_type: device_state.device_type, serial_number: event.client_id }
-      if device_state.has?('solar_power')
-        value = device_state.fetch('solar_power')
+      if device_state.has?('dc_input_power')
+        value = device_state.fetch('dc_input_power')
         @solar_power.observe(value, labels)
-        @solar_power_wh.observe(value * elapsed_hours('solar_power'), labels)
+        @solar_power_wh.observe(integral_hours('solar_power', value), labels)
       end
-      if device_state.has?('grid_power')
-        value = device_state.fetch('grid_power')
+      if device_state.has?('ac_input_power')
+        value = device_state.fetch('ac_input_power')
         @grid_power.observe(value, labels)
-        @grid_power_wh.observe(value * elapsed_hours('grid_power'), labels)
+        @grid_power_wh.observe(integral_hours('grid_power', value), labels)
       end
       if device_state.has?('ac_output_power')
         value = device_state.fetch('ac_output_power')
         @ac_output_power.observe(value, labels)
-        @ac_output_power_wh.observe(value * elapsed_hours('ac_output_power'), labels)
+        @ac_output_power_wh.observe(integral_hours('ac_output_power', value), labels)
       end
       if device_state.has?('dc_output_power')
         value = device_state.fetch('dc_output_power')
         @dc_output_power.observe(value, labels)
-        @dc_output_power_wh.observe(value * elapsed_hours('dc_output_power'), labels)
+        @dc_output_power_wh.observe(integral_hours('dc_output_power', value), labels)
       end
       if device_state.has?('total_battery_percent')
         @total_battery_percent.observe(device_state.fetch('total_battery_percent'), labels)
@@ -84,15 +84,17 @@ module PowerStation
       @cell_voltage = build_gauge('cell_voltage', 'Voltage of a single cell in a pack')
     end
 
-    def elapsed_hours(field_name)
+    def integral_hours(field_name, new_value)
       @mutex.synchronize do
         now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        if @elapsed_hours.key?(field_name)
-          last_time = @elapsed_hours[field_name]
-          @elapsed_hours[field_name] = now
-          (now - last_time) / 3600.0
+        if @integral_hours.key?(field_name)
+          last_time, last_value = @integral_hours[field_name]
+          @integral_hours[field_name] = [now, new_value]
+
+          # Calculate the trapazoidal area - 1/2 * h * (d1 + d2)
+          0.5 * (now - last_time) / 3600.0 * (last_value + new_value)
         else
-          @elapsed_hours[field_name] = now
+          @integral_hours[field_name] = [now, new_value]
           0
         end
       end
